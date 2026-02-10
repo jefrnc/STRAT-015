@@ -1,0 +1,115 @@
+name: Deploy
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  SERVICE_NAME: strat-015-scanner
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      image: ${{ steps.version.outputs.image }}
+      release_name: ${{ steps.version.outputs.release_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            VERSION="${{ github.event.release.tag_name }}"
+            RELEASE_NAME="${{ github.event.release.name }}"
+          else
+            VERSION="v$(cat VERSION 2>/dev/null || echo '1.0.0')"
+            RELEASE_NAME="Manual deploy $VERSION"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "image=${{ env.REGISTRY }}/algojj/strat-015:$VERSION" >> $GITHUB_OUTPUT
+          echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/algojj/strat-015:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/algojj/strat-015:latest
+
+  deploy-k3s:
+    runs-on: [self-hosted, prod]
+    needs: build-and-push
+    outputs:
+      deploy_status: ${{ steps.deploy.outputs.status }}
+    steps:
+      - name: Deploy to K3s
+        id: deploy
+        run: |
+          IMAGE="${{ needs.build-and-push.outputs.image }}"
+          echo "Deploying ${{ env.SERVICE_NAME }} with $IMAGE"
+          sudo kubectl set image deployment/${{ env.SERVICE_NAME }} \
+            ${{ env.SERVICE_NAME }}=$IMAGE \
+            -n smallcaps-prod
+          sudo kubectl rollout status deployment/${{ env.SERVICE_NAME }} \
+            -n smallcaps-prod --timeout=180s
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "Deploy OK: ${{ env.SERVICE_NAME }}"
+
+  notify-discord:
+    runs-on: ubuntu-latest
+    needs: [build-and-push, deploy-k3s]
+    if: always()
+    steps:
+      - name: Send Discord notification
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
+          VERSION: ${{ needs.build-and-push.outputs.version }}
+          RELEASE_NAME: ${{ needs.build-and-push.outputs.release_name }}
+          DEPLOY_STATUS: ${{ needs.deploy-k3s.result }}
+        run: |
+          if [ "$DEPLOY_STATUS" = "success" ]; then
+            COLOR=3066993
+            TITLE="Deploy Exitoso"
+            DESCRIPTION="STRAT-015 S17 VWAP Premium Fade SHORT desplegado"
+          else
+            COLOR=15158332
+            TITLE="Deploy Fallido"
+            DESCRIPTION="El deploy falló. Revisar logs."
+          fi
+
+          if [ -n "$DISCORD_WEBHOOK" ]; then
+            curl -H "Content-Type: application/json" \
+              -X POST \
+              -d "{
+                \"embeds\": [{
+                  \"title\": \"$TITLE\",
+                  \"description\": \"$RELEASE_NAME\",
+                  \"color\": $COLOR,
+                  \"fields\": [
+                    {\"name\": \"Versión\", \"value\": \"$VERSION\", \"inline\": true},
+                    {\"name\": \"Servicio\", \"value\": \"${{ env.SERVICE_NAME }}\", \"inline\": true},
+                    {\"name\": \"Ambiente\", \"value\": \"Production\", \"inline\": true}
+                  ],
+                  \"footer\": {\"text\": \"SmallCaps Scanner\"},
+                  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+                }]
+              }" \
+              "$DISCORD_WEBHOOK"
+          fi
